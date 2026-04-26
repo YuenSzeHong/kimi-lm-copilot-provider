@@ -23,10 +23,11 @@ The client sends:
 - `model`
 - `messages`
 - `stream`
-- `thinking`
+- `thinking` (as `{ type: "enabled", keep: "all" }` or `{ type: "disabled" }`)
 - `top_p` (optional)
-- `max_tokens` (optional)
+- `max_completion_tokens` (optional)
 - `tools` (optional)
+- `tool_choice` (optional, `auto` or `required`)
 - `stop` (optional)
 - `prompt_cache_key` (optional, from `metadata.taskId`)
 
@@ -34,6 +35,7 @@ Notes:
 
 - `temperature` is not sent by this extension. I am letting API handle it by itself. Chinese providers are better at handling these stuff by themselves, and I don't want to mess with it.
 - `safety_identifier` is not sent.
+- Image and data attachments are supported via `LanguageModelDataPart`; images are base64-encoded into `image_url` objects.
 
 ## Default Headers
 
@@ -52,4 +54,6 @@ Each request includes:
 ## Streaming and Tools
 
 - Streaming responses are consumed as SSE (`data:` lines).
+- Reasoning content (`reasoning_content`) is streamed and rendered in collapsible `<details><summary>Thinking</summary>` blocks.
 - Tool calls are collected from streamed deltas and emitted when the model finishes with `tool_calls`.
+- If the model returns tool calls after reasoning, the reasoning block is automatically closed before the tool calls are emitted.
