@@ -1,9 +1,9 @@
-import type * as vscode from "vscode";
+import * as vscode from "vscode";
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
 
 const CHAT_ENDPOINT = "/chat/completions";
-const VERSION = "0.1.0";
+const VERSION = "0.1.2";
 const DEVICE_ID = randomUUID().replace(/-/g, "");
 
 function getDefaultHeaders(apiKey: string): Record<string, string> {
@@ -18,12 +18,20 @@ function getDefaultHeaders(apiKey: string): Record<string, string> {
 	};
 }
 
+export type KimiContent =
+	| string
+	| Array<
+			| { type: "text"; text: string }
+			| { type: "image_url"; image_url: { url: string } }
+	>;
+
 export interface KimiMessage {
 	role: "system" | "user" | "assistant" | "tool";
-	content: string;
+	content: KimiContent;
 	name?: string;
 	tool_calls?: KimiToolCall[];
 	tool_call_id?: string;
+	reasoning_content?: string;
 }
 
 export interface KimiToolCall {
@@ -51,29 +59,36 @@ interface ChatOptions {
 	stop?: string[];
 	thinking?: boolean;
 	promptCacheKey?: string;
+	toolMode?: vscode.LanguageModelChatToolMode;
+	/**
+	 * When true (default), the stream must end with `data: [DONE]` or an error is thrown (Moonshot streaming docs).
+	 * Kimi Coding (`api.kimi.com/coding`) may close the connection without sending `[DONE]`; set false for that endpoint.
+	 */
+	requireSseDoneMarker?: boolean;
 }
 
 interface KimiStreamChunk {
 	id: string;
 	created: number;
 	model: string;
-	choices: Array<{
-		index: number;
-		delta: {
-			role?: string;
-			content?: string;
-			tool_calls?: Array<{
-				index: number;
-				id?: string;
-				type?: string;
-				function?: {
-					name?: string;
-					arguments?: string;
-				};
-			}>;
-		};
-		finish_reason: string | null;
-	}>;
+		choices: Array<{
+			index: number;
+			delta: {
+				role?: string;
+				content?: string;
+				reasoning_content?: string;
+				tool_calls?: Array<{
+					index: number;
+					id?: string;
+					type?: string;
+					function?: {
+						name?: string;
+						arguments?: string;
+					};
+				}>;
+			};
+			finish_reason: string | null;
+		}>;
 }
 
 interface KimiResponse {
@@ -107,6 +122,19 @@ export class KimiApiError extends Error {
 	}
 }
 
+export function summarizeErrorResponse(response: unknown, maxChars = 400): string {
+	try {
+		const text =
+			typeof response === "string" ? response : JSON.stringify(response);
+		if (text.length <= maxChars) {
+			return text;
+		}
+		return `${text.slice(0, maxChars)}...`;
+	} catch {
+		return "";
+	}
+}
+
 export class KimiApiClient {
 	private readonly headers: Record<string, string>;
 
@@ -121,7 +149,7 @@ export class KimiApiClient {
 		options?: ChatOptions,
 		cancellationToken?: vscode.CancellationToken,
 	): AsyncGenerator<KimiStreamChunk> {
-		const response = await this.sendRequest(model, messages, baseUrl, true, options);
+		const response = await this.sendRequest(model, messages, baseUrl, true, options, cancellationToken);
 
 		if (!response.body) {
 			throw new KimiApiError("No response body", 0);
@@ -130,11 +158,15 @@ export class KimiApiClient {
 		const reader = response.body.getReader();
 		const decoder = new TextDecoder();
 		let buffer = "";
+		let sawDataEvent = false;
+		let sawDoneMarker = false;
+		const strictSseDone =
+			options?.requireSseDoneMarker !== false;
 
 		try {
 			while (true) {
 				if (cancellationToken?.isCancellationRequested) {
-					reader.cancel();
+					await reader.cancel();
 					break;
 				}
 
@@ -150,14 +182,30 @@ export class KimiApiClient {
 					if (!trimmed || !trimmed.startsWith("data:")) continue;
 
 					const data = trimmed.slice(5).trim();
-					if (data === "[DONE]") return;
+					if (data === "[DONE]") {
+						sawDoneMarker = true;
+						return;
+					}
 
+					sawDataEvent = true;
 					try {
 						yield JSON.parse(data) as KimiStreamChunk;
 					} catch {
-						// Malformed SSE chunks are non-fatal; skip and continue
+						console.warn("Malformed SSE chunk skipped:", data);
 					}
 				}
+			}
+
+			if (
+				strictSseDone &&
+				!cancellationToken?.isCancellationRequested &&
+				sawDataEvent &&
+				!sawDoneMarker
+			) {
+				throw new KimiApiError(
+					"Stream ended without a data: [DONE] chunk; the response may be incomplete (see Kimi streaming API documentation).",
+					0,
+				);
 			}
 		} finally {
 			reader.releaseLock();
@@ -169,8 +217,9 @@ export class KimiApiClient {
 		messages: KimiMessage[],
 		baseUrl: string,
 		options?: ChatOptions,
+		cancellationToken?: vscode.CancellationToken,
 	): Promise<KimiResponse> {
-		const response = await this.sendRequest(model, messages, baseUrl, false, options);
+		const response = await this.sendRequest(model, messages, baseUrl, false, options, cancellationToken);
 		return response.json() as Promise<KimiResponse>;
 	}
 
@@ -185,14 +234,16 @@ export class KimiApiClient {
 			model,
 			messages,
 			stream,
-			thinking: { type: thinking ? "enabled" : "disabled" },
+			thinking: thinking
+				? { type: "enabled", keep: "all" }
+				: { type: "disabled" },
 		};
 
 		if (options?.topP !== undefined) {
 			body.top_p = options.topP;
 		}
 		if (options?.maxTokens !== undefined) {
-			body.max_tokens = options.maxTokens;
+			body.max_completion_tokens = options.maxTokens;
 		}
 		if (options?.tools !== undefined) {
 			body.tools = options.tools;
@@ -202,6 +253,11 @@ export class KimiApiClient {
 		}
 		if (options?.promptCacheKey) {
 			body.prompt_cache_key = options.promptCacheKey;
+		}
+		if (options?.toolMode === vscode.LanguageModelChatToolMode.Auto) {
+			body.tool_choice = "auto";
+		} else if (options?.toolMode === vscode.LanguageModelChatToolMode.Required) {
+			body.tool_choice = "required";
 		}
 
 		return JSON.stringify(body);
@@ -213,23 +269,34 @@ export class KimiApiClient {
 		baseUrl: string,
 		stream: boolean,
 		options?: ChatOptions,
+		cancellationToken?: vscode.CancellationToken,
 	): Promise<Response> {
-		const response = await fetch(`${baseUrl}${CHAT_ENDPOINT}`, {
-			method: "POST",
-			headers: this.headers,
-			body: this.buildRequestBody(model, messages, stream, options),
+		const abortController = new AbortController();
+		const abortListener = cancellationToken?.onCancellationRequested(() => {
+			abortController.abort();
 		});
 
-		if (response.ok) {
-			return response;
-		}
+		try {
+			const response = await fetch(`${baseUrl}${CHAT_ENDPOINT}`, {
+				method: "POST",
+				headers: this.headers,
+				body: this.buildRequestBody(model, messages, stream, options),
+				signal: abortController.signal,
+			});
 
-		const errorBody = await this.parseErrorBody(response);
-		throw new KimiApiError(
-			`Kimi API error: ${response.status} ${response.statusText}`,
-			response.status,
-			errorBody,
-		);
+			if (response.ok) {
+				return response;
+			}
+
+			const errorBody = await this.parseErrorBody(response);
+			throw new KimiApiError(
+				`Kimi API error: ${response.status} ${response.statusText}`,
+				response.status,
+				errorBody,
+			);
+		} finally {
+			abortListener?.dispose();
+		}
 	}
 
 	private async parseErrorBody(response: Response): Promise<unknown> {

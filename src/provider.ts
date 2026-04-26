@@ -2,68 +2,21 @@ import * as vscode from "vscode";
 import {
 	KimiApiClient,
 	KimiApiError,
+	summarizeErrorResponse,
 	type KimiMessage,
 	type KimiTool,
 } from "./api.js";
 import { KIMI_MODELS, toLanguageModelChatInformation } from "./models.js";
-
-interface ThinkingState {
-	buffer: string;
-	insideThinking: boolean;
-}
+import {
+	assistantToolCallThinkingPayload,
+	THINK_CLOSE_REPLACEMENT,
+	THINK_OPEN_REPLACEMENT,
+} from "./reasoning.js";
 
 interface ToolCallBuilder {
 	id: string;
 	name: string;
 	arguments: string;
-}
-
-const THINK_OPEN = "<think>";
-const THINK_CLOSE = "</think>";
-const THINK_OPEN_REPLACEMENT = '<details><summary>Thinking</summary>\n\n';
-const THINK_CLOSE_REPLACEMENT = '\n\n</details>\n\n';
-
-function findTrailingPartialMatch(buffer: string, tag: string): number {
-	for (let i = Math.min(tag.length - 1, buffer.length); i >= 1; i--) {
-		if (buffer.slice(-i) === tag.slice(0, i)) {
-			return i;
-		}
-	}
-	return 0;
-}
-
-function processThinkingContent(
-	content: string,
-	state: ThinkingState,
-): { output: string; state: ThinkingState } {
-	let output = "";
-	let buffer = state.buffer + content;
-	let insideThinking = state.insideThinking;
-
-	while (buffer.length > 0) {
-		const tag = insideThinking ? THINK_CLOSE : THINK_OPEN;
-		const replacement = insideThinking ? THINK_CLOSE_REPLACEMENT : THINK_OPEN_REPLACEMENT;
-		const tagIdx = buffer.indexOf(tag);
-
-		if (tagIdx !== -1) {
-			output += buffer.slice(0, tagIdx) + replacement;
-			buffer = buffer.slice(tagIdx + tag.length);
-			insideThinking = !insideThinking;
-			continue;
-		}
-
-		const partialMatch = findTrailingPartialMatch(buffer, tag);
-		if (partialMatch > 0) {
-			output += buffer.slice(0, -partialMatch);
-			buffer = buffer.slice(-partialMatch);
-		} else {
-			output += buffer;
-			buffer = "";
-		}
-		break;
-	}
-
-	return { output, state: { buffer, insideThinking } };
 }
 
 function getObjectProperty(
@@ -117,6 +70,22 @@ function getToolCallBuilder(
 	return created;
 }
 
+function parseToolCallArguments(raw: string): Record<string, unknown> {
+	const s = raw.trim() || "{}";
+	try {
+		const parsed: unknown = JSON.parse(s);
+		if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+			return parsed as Record<string, unknown>;
+		}
+		return { _nonObjectToolArguments: parsed };
+	} catch {
+		return {
+			_invalidToolArgumentsJson: true,
+			_rawArguments: raw,
+		};
+	}
+}
+
 function emitToolCalls(
 	progress: vscode.Progress<vscode.LanguageModelResponsePart>,
 	builders: Map<number, ToolCallBuilder>,
@@ -124,10 +93,7 @@ function emitToolCalls(
 	for (const [, builder] of builders) {
 		if (!builder.id || !builder.name) continue;
 
-		let args: Record<string, unknown> = {};
-		try {
-			args = JSON.parse(builder.arguments || "{}");
-		} catch {}
+		const args = parseToolCallArguments(builder.arguments);
 		progress.report(
 			new vscode.LanguageModelToolCallPart(builder.id, builder.name, args),
 		);
@@ -137,10 +103,12 @@ function emitToolCalls(
 
 function mapKimiApiError(error: KimiApiError): Error {
 	const detail = error.response
-		? ` Response: ${JSON.stringify(error.response)}`
+		? ` Response: ${summarizeErrorResponse(error.response)}`
 		: "";
 
 	switch (error.statusCode) {
+		case 0:
+			return new Error(`${error.message}${detail}`);
 		case 401:
 			return new Error(
 				`Authentication failed (401). Check your API key from kimi.com/code/console.${detail}`,
@@ -186,27 +154,39 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 		}
 
 		const client = new KimiApiClient(this.apiKey);
-		const kimiMessages = this.convertMessages(messages);
+		const modelDef = KIMI_MODELS.find((m) => m.id === model.id);
+		const thinking = modelDef?.thinking ?? false;
+		const kimiMessages = this.convertMessages(messages, thinking);
 		const kimiTools = this.convertTools(options.tools);
 		const maxTokens = options.modelOptions?.maxTokens as number | undefined;
 		const promptCacheKey = getPromptCacheKey(options);
-
-		const modelDef = KIMI_MODELS.find((m) => m.id === model.id);
-		const thinking = modelDef?.thinking ?? false;
 		const baseUrl = modelDef?.baseUrl ?? "https://api.kimi.com/coding/v1";
+		const requireSseDoneMarker = modelDef?.requireSseDoneMarker ?? true;
 
 		try {
 			const stream = client.streamChat(
 				model.id,
 				kimiMessages,
 				baseUrl,
-				{ maxTokens, tools: kimiTools, thinking, promptCacheKey },
+				{
+					maxTokens,
+					tools: kimiTools,
+					thinking,
+					promptCacheKey,
+					toolMode: options.toolMode,
+					requireSseDoneMarker,
+				},
 				token,
 			);
 
 			const toolCallBuilders = new Map<number, ToolCallBuilder>();
+			let reasoningOpen = false;
 
-			let thinkingState: ThinkingState = { buffer: "", insideThinking: false };
+			const closeReasoningIfOpen = (): void => {
+				if (!reasoningOpen) return;
+				progress.report(new vscode.LanguageModelTextPart(THINK_CLOSE_REPLACEMENT));
+				reasoningOpen = false;
+			};
 
 			for await (const chunk of stream) {
 				if (token.isCancellationRequested) break;
@@ -214,12 +194,17 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 				for (const choice of chunk.choices) {
 					const delta = choice.delta;
 
-					if (delta.content) {
-						const result = processThinkingContent(delta.content, thinkingState);
-						thinkingState = result.state;
-						if (result.output) {
-							progress.report(new vscode.LanguageModelTextPart(result.output));
+					if (delta.reasoning_content) {
+						if (!reasoningOpen) {
+							progress.report(new vscode.LanguageModelTextPart(THINK_OPEN_REPLACEMENT));
+							reasoningOpen = true;
 						}
+						progress.report(new vscode.LanguageModelTextPart(delta.reasoning_content));
+					}
+
+					if (delta.content) {
+						closeReasoningIfOpen();
+						progress.report(new vscode.LanguageModelTextPart(delta.content));
 					}
 
 					if (delta.tool_calls) {
@@ -233,10 +218,14 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 					}
 
 					if (choice.finish_reason === "tool_calls") {
+						closeReasoningIfOpen();
 						emitToolCalls(progress, toolCallBuilders);
 					}
 				}
 			}
+
+			closeReasoningIfOpen();
+			emitToolCalls(progress, toolCallBuilders);
 		} catch (error) {
 			if (!(error instanceof KimiApiError)) throw error;
 			throw mapKimiApiError(error);
@@ -256,6 +245,8 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 		for (const part of text.content) {
 			if (part instanceof vscode.LanguageModelTextPart) {
 				totalChars += part.value.length;
+			} else if (part instanceof vscode.LanguageModelDataPart) {
+				totalChars += part.data.length;
 			}
 		}
 		return Promise.resolve(Math.ceil(totalChars / 4));
@@ -263,18 +254,39 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 
 	private convertMessages(
 		messages: readonly vscode.LanguageModelChatRequestMessage[],
+		thinkingEnabled: boolean,
 	): KimiMessage[] {
 		const result: KimiMessage[] = [];
 
 		for (const msg of messages) {
 			const role = this.convertRole(msg.role);
-			let content = "";
+			const textParts: string[] = [];
+			const imageParts: Array<{ type: "image_url"; image_url: { url: string } }> = [];
 			let toolCalls: KimiMessage["tool_calls"] | undefined;
-			let toolCallId: string | undefined;
+			const toolResults: Array<{ callId: string; content: string }> = [];
 
 			for (const part of msg.content) {
 				if (part instanceof vscode.LanguageModelTextPart) {
-					content += part.value;
+					textParts.push(part.value);
+				} else if (part instanceof vscode.LanguageModelDataPart) {
+					const mime = part.mimeType.toLowerCase();
+					if (mime.startsWith("image/")) {
+						const b64 = Buffer.from(part.data).toString("base64");
+						imageParts.push({
+							type: "image_url",
+							image_url: { url: `data:${part.mimeType};base64,${b64}` },
+						});
+					} else if (
+						mime === "text/plain" ||
+						mime === "application/json" ||
+						mime.endsWith("+json")
+					) {
+						textParts.push(new TextDecoder("utf-8", { fatal: false }).decode(part.data));
+					} else {
+						textParts.push(
+							`\n[Attachment omitted (not an image): ${part.mimeType}, ${part.data.length} bytes]\n`,
+						);
+					}
 				} else if (part instanceof vscode.LanguageModelToolCallPart) {
 					if (!toolCalls) toolCalls = [];
 					toolCalls.push({
@@ -286,19 +298,48 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 						},
 					});
 				} else if (part instanceof vscode.LanguageModelToolResultPart) {
-					toolCallId = part.callId;
-					content =
-						typeof part.content === "string"
-							? part.content
-							: JSON.stringify(part.content);
+					toolResults.push({
+						callId: part.callId,
+						content:
+							typeof part.content === "string"
+								? part.content
+								: JSON.stringify(part.content),
+					});
 				}
 			}
 
-			if (toolCallId) {
-				result.push({ role: "tool", content, tool_call_id: toolCallId });
-			} else if (toolCalls && toolCalls.length > 0) {
-				result.push({ role: "assistant", content: content || "", tool_calls: toolCalls });
-			} else {
+			for (const toolResult of toolResults) {
+				result.push({ role: "tool", content: toolResult.content, tool_call_id: toolResult.callId });
+			}
+
+			if (toolCalls && toolCalls.length > 0) {
+				const mergedText = textParts.join("") || "";
+				if (thinkingEnabled) {
+					const { content, reasoning_content } =
+						assistantToolCallThinkingPayload(mergedText);
+					result.push({
+						role: "assistant",
+						content,
+						tool_calls: toolCalls,
+						reasoning_content,
+					});
+				} else {
+					result.push({
+						role: "assistant",
+						content: mergedText,
+						tool_calls: toolCalls,
+					});
+				}
+			} else if (toolResults.length === 0) {
+				const content: KimiMessage["content"] =
+					imageParts.length > 0
+						? [
+								...(textParts.length > 0
+									? textParts.map((t) => ({ type: "text" as const, text: t }))
+									: []),
+								...imageParts,
+							]
+						: textParts.join("");
 				result.push({ role, content, name: msg.name });
 			}
 		}

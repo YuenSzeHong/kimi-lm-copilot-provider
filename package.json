@@ -2,14 +2,17 @@
 	"name": "kimi-lm-provider",
 	"displayName": "Kimi Language Model Provider for Copilot",
 	"description": "Registers Kimi (Moonshot AI) models as VS Code language model providers for Copilot Chat",
-	"version": "0.1.0",
+	"version": "0.1.2",
 	"publisher": "DenizhanDaklr",
 	"license": "MIT",
 	"repository": "https://github.com/zelosleone/kimi-lm-copilot-provider",
 	"icon": "images/icon.png",
 	"engines": {
-		"vscode": "^1.108.0"
+		"vscode": "^1.110.0"
 	},
+	"enabledApiProposals": [
+		"languageModelDataPart"
+	],
 	"categories": [
 		"AI",
 		"Chat"
@@ -46,7 +49,7 @@
 	},
 	"devDependencies": {
 		"@types/node": "20.19.29",
-		"@types/vscode": "1.108.0",
+		"@types/vscode": "1.110.0",
 		"typescript": "5.9.3"
 	}
 }

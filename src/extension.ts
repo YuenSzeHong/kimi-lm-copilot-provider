@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { KimiApiClient, KimiApiError } from "./api";
+import { KimiApiClient, KimiApiError, summarizeErrorResponse } from "./api";
 import { KimiChatProvider } from "./provider";
 
 const DEFAULT_BASE_URL = "https://api.kimi.com/coding/v1";
@@ -7,7 +7,7 @@ const DEFAULT_MODEL_ID = "kimi-for-coding";
 
 function formatConnectionError(err: unknown): string {
 	const detail = err instanceof KimiApiError && err.response
-		? ` ${JSON.stringify(err.response)}`
+		? ` ${summarizeErrorResponse(err.response)}`
 		: "";
 	return `Kimi test failed: ${err instanceof Error ? err.message : String(err)}${detail}`;
 }

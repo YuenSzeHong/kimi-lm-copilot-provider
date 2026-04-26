@@ -10,6 +10,11 @@ interface KimiModelInfo {
 	tooltip: string;
 	baseUrl: string;
 	thinking: boolean;
+	/**
+	 * When true, streaming must include a terminal `data: [DONE]` SSE event (strict Moonshot behavior).
+	 * Kimi Coding API may omit it; set false for those models.
+	 */
+	requireSseDoneMarker: boolean;
 	capabilities: {
 		imageInput: boolean;
 		toolCalling: boolean;
@@ -26,8 +31,9 @@ export const KIMI_MODELS: KimiModelInfo[] = [
 		maxInputTokens: 262144,
 		maxOutputTokens: 32768,
 		baseUrl: "https://api.kimi.com/coding/v1",
-		thinking: false,
-		capabilities: { imageInput: false, toolCalling: true },
+		thinking: true,
+		requireSseDoneMarker: false,
+		capabilities: { imageInput: true, toolCalling: true },
 	},
 ];
 
