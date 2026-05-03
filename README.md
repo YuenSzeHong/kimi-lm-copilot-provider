@@ -54,6 +54,6 @@ Each request includes:
 ## Streaming and Tools
 
 - Streaming responses are consumed as SSE (`data:` lines).
-- Reasoning content (`reasoning_content`) is streamed and rendered in collapsible `<details><summary>Thinking</summary>` blocks.
+- Reasoning content (`reasoning_content`) is preserved in the streamed response and wrapped by the extension with HTML markers (`<details><summary>Thinking</summary>...</details>`) so the reasoning is kept in the chat turn and can be extracted by the provider code.
+- Note: VS Code's stable Language Model Chat Provider API treats streamed text parts as plain content; for BYOK/custom providers the editor may display those markers literally or not render a native collapsible UI. Built-in Copilot models and some VS Code Insiders/Copilot builds provide a dedicated thinking UI that can collapse reasoning — use those for the native collapsed experience.
 - Tool calls are collected from streamed deltas and emitted when the model finishes with `tool_calls`.
-- If the model returns tool calls after reasoning, the reasoning block is automatically closed before the tool calls are emitted.
