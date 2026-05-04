@@ -1,6 +1,6 @@
-export const THINK_OPEN_REPLACEMENT =
+const THINK_OPEN_REPLACEMENT =
 	"<details><summary>Thinking</summary>\n\n";
-export const THINK_CLOSE_REPLACEMENT = "\n\n</details>\n\n";
+const THINK_CLOSE_REPLACEMENT = "\n\n</details>\n\n";
 
 export const KIMI_TOOL_CALL_REASONING_FALLBACK =
 	"(reasoning not preserved in chat history)";
@@ -57,23 +57,16 @@ export function assistantToolCallThinkingPayload(mergedText: string): {
 	reasoning_content: string;
 } {
 	const split = extractThinkingFromAssistantText(mergedText);
-	const mergedTrim = mergedText.trim();
-	let content = split.visibleContent;
-	let reasoning = split.reasoningContent.trim();
-	const blockWasParsed =
-		split.reasoningContent !== "" || split.visibleContent !== mergedText;
 
-	if (reasoning.length > 0) {
-	} else if (!blockWasParsed && mergedTrim.length > 0) {
-		reasoning = mergedTrim;
-		content = "";
-	} else {
-		reasoning = KIMI_TOOL_CALL_REASONING_FALLBACK;
+	if (split.reasoningContent.trim().length > 0) {
+		return {
+			content: split.visibleContent,
+			reasoning_content: split.reasoningContent.trim(),
+		};
 	}
 
-	if (mergedTrim.length === 0) {
-		content = "";
-	}
-
-	return { content, reasoning_content: reasoning };
+	return {
+		content: mergedText.trim(),
+		reasoning_content: KIMI_TOOL_CALL_REASONING_FALLBACK,
+	};
 }
