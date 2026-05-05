@@ -9,8 +9,6 @@ import {
 import { KIMI_MODELS, toLanguageModelChatInformation } from "./models.js";
 import {
 	assistantToolCallThinkingPayload,
-	THINK_OPEN_REPLACEMENT,
-	THINK_CLOSE_REPLACEMENT,
 } from "./reasoning.js";
 
 interface ToolCallBuilder {
@@ -163,8 +161,6 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 		const baseUrl = modelDef?.baseUrl ?? "https://api.kimi.com/coding/v1";
 		const requireSseDoneMarker = modelDef?.requireSseDoneMarker ?? true;
 
-		let thinkingBlockOpen = false;
-
 		try {
 			const stream = client.streamChat(
 				model.id,
@@ -190,18 +186,10 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 					const delta = choice.delta;
 
 					if (delta.reasoning_content) {
-						if (!thinkingBlockOpen) {
-							progress.report(new vscode.LanguageModelTextPart(THINK_OPEN_REPLACEMENT));
-							thinkingBlockOpen = true;
-						}
 						progress.report(new vscode.LanguageModelTextPart(delta.reasoning_content));
 					}
 
 					if (delta.content) {
-						if (thinkingBlockOpen) {
-							progress.report(new vscode.LanguageModelTextPart(THINK_CLOSE_REPLACEMENT));
-							thinkingBlockOpen = false;
-						}
 						progress.report(new vscode.LanguageModelTextPart(delta.content));
 					}
 
@@ -216,21 +204,12 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 					}
 
 					if (choice.finish_reason === "tool_calls") {
-						if (thinkingBlockOpen) {
-							progress.report(new vscode.LanguageModelTextPart(THINK_CLOSE_REPLACEMENT));
-							thinkingBlockOpen = false;
-						}
 						emitToolCalls(progress, toolCallBuilders);
 					}
 				}
 			}
 
-			if (thinkingBlockOpen) {
-				progress.report(new vscode.LanguageModelTextPart(THINK_CLOSE_REPLACEMENT));
-				thinkingBlockOpen = false;
-			}
-
-				emitToolCalls(progress, toolCallBuilders);
+			emitToolCalls(progress, toolCallBuilders);
 		} catch (error) {
 			if (!(error instanceof KimiApiError)) throw error;
 			throw mapKimiApiError(error);
