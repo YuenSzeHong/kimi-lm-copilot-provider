@@ -1,5 +1,22 @@
 import type * as vscode from "vscode";
 
+const KIMI_CONFIGURATION_SCHEMA = {
+	properties: {
+		thinkingMode: {
+			type: "string",
+			title: "Thinking",
+			enum: ["enabled", "disabled"],
+			enumItemLabels: ["On", "Off"],
+			default: "enabled",
+			group: "navigation",
+		},
+	},
+} as const;
+
+type ModelPickerInformation = vscode.LanguageModelChatInformation & {
+	configurationSchema?: unknown;
+};
+
 interface KimiModelInfo {
 	id: string;
 	name: string;
@@ -39,7 +56,7 @@ export const KIMI_MODELS: KimiModelInfo[] = [
 
 export function toLanguageModelChatInformation(
 	model: KimiModelInfo,
-): vscode.LanguageModelChatInformation {
+): ModelPickerInformation {
 	const {
 		id,
 		name,
@@ -61,5 +78,6 @@ export function toLanguageModelChatInformation(
 		maxInputTokens,
 		maxOutputTokens,
 		capabilities,
+		configurationSchema: KIMI_CONFIGURATION_SCHEMA,
 	};
 }

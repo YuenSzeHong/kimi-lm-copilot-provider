@@ -7,9 +7,7 @@ import {
 	type KimiTool,
 } from "./api.js";
 import { KIMI_MODELS, toLanguageModelChatInformation } from "./models.js";
-import {
-	assistantToolCallThinkingPayload,
-} from "./reasoning.js";
+import { assistantToolCallThinkingPayload } from "./reasoning.js";
 
 interface ToolCallBuilder {
 	id: string;
@@ -153,7 +151,7 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 
 		const client = new KimiApiClient(this.apiKey);
 		const modelDef = KIMI_MODELS.find((m) => m.id === model.id);
-		const thinking = modelDef?.thinking ?? false;
+		const thinking = this.resolveThinkingEnabled(modelDef, options);
 		const kimiMessages = this.convertMessages(messages, thinking);
 		const kimiTools = this.convertTools(options.tools);
 		const maxTokens = options.modelOptions?.maxTokens as number | undefined;
@@ -179,6 +177,13 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 
 			const toolCallBuilders = new Map<number, ToolCallBuilder>();
 
+			const reportThinkingPart = (text: string): void => {
+				const thinkingPart = createThinkingPart(text);
+				if (thinkingPart) {
+					progress.report(thinkingPart);
+				}
+			};
+
 			for await (const chunk of stream) {
 				if (token.isCancellationRequested) break;
 
@@ -186,7 +191,7 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 					const delta = choice.delta;
 
 					if (delta.reasoning_content) {
-						progress.report(new vscode.LanguageModelTextPart(delta.reasoning_content));
+						reportThinkingPart(delta.reasoning_content);
 					}
 
 					if (delta.content) {
@@ -231,6 +236,11 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 				totalChars += part.value.length;
 			} else if (part instanceof vscode.LanguageModelDataPart) {
 				totalChars += part.data.length;
+			} else if (isThinkingPart(part)) {
+				const thinkingValue = getValueFromThinkingPart(part);
+				if (thinkingValue) {
+					totalChars += thinkingValue.length;
+				}
 			}
 		}
 		return Promise.resolve(Math.ceil(totalChars / 4));
@@ -248,6 +258,7 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 			const imageParts: Array<{ type: "image_url"; image_url: { url: string } }> = [];
 			let toolCalls: KimiMessage["tool_calls"] | undefined;
 			const toolResults: Array<{ callId: string; content: string }> = [];
+			let reasoningFromThinkingPart: string | undefined;
 
 			for (const part of msg.content) {
 				if (part instanceof vscode.LanguageModelTextPart) {
@@ -289,6 +300,13 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 								? part.content
 								: JSON.stringify(part.content),
 					});
+				} else if (isThinkingPart(part)) {
+					const thinkingValue = getValueFromThinkingPart(part);
+					if (thinkingValue) {
+						reasoningFromThinkingPart = reasoningFromThinkingPart
+							? reasoningFromThinkingPart + thinkingValue
+							: thinkingValue;
+					}
 				}
 			}
 
@@ -298,7 +316,14 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 
 			if (toolCalls && toolCalls.length > 0) {
 				const mergedText = textParts.join("") || "";
-				if (thinkingEnabled) {
+				if (thinkingEnabled && reasoningFromThinkingPart) {
+					result.push({
+						role: "assistant",
+						content: mergedText,
+						tool_calls: toolCalls,
+						reasoning_content: reasoningFromThinkingPart,
+					});
+				} else if (thinkingEnabled) {
 					const { content, reasoning_content } =
 						assistantToolCallThinkingPayload(mergedText);
 					result.push({
@@ -358,4 +383,86 @@ export class KimiChatProvider implements vscode.LanguageModelChatProvider {
 			},
 		}));
 	}
+
+	private resolveThinkingEnabled(
+		modelDef: (typeof KIMI_MODELS)[number] | undefined,
+		options: vscode.ProvideLanguageModelChatResponseOptions,
+	): boolean {
+		if (!modelDef?.thinking) {
+			return false;
+		}
+
+		const mode = readStringOption(options, "thinkingMode");
+		if (mode === "disabled") {
+			return false;
+		}
+
+		return true;
+	}
+}
+
+function createThinkingPart(text: string): vscode.LanguageModelResponsePart | undefined {
+	const vscodeWithThinking = vscode as typeof vscode & {
+		LanguageModelThinkingPart?: new (value: string) => vscode.LanguageModelResponsePart;
+	};
+
+	if (typeof vscodeWithThinking.LanguageModelThinkingPart !== "function") {
+		return undefined;
+	}
+
+	return new vscodeWithThinking.LanguageModelThinkingPart(text) as unknown as vscode.LanguageModelResponsePart;
+}
+
+function getValueFromThinkingPart(part: unknown): string | undefined {
+	const candidate = part as { value?: unknown } | null;
+	if (!candidate || !candidate.value) {
+		return undefined;
+	}
+
+	if (typeof candidate.value === "string") {
+		return candidate.value;
+	}
+
+	if (Array.isArray(candidate.value)) {
+		return candidate.value.join("");
+	}
+
+	return undefined;
+}
+
+function isThinkingPart(part: unknown): part is vscode.LanguageModelResponsePart {
+	const vscodeWithThinking = vscode as typeof vscode & {
+		LanguageModelThinkingPart?: new (value: string) => vscode.LanguageModelResponsePart;
+	};
+
+	if (typeof vscodeWithThinking.LanguageModelThinkingPart !== "function") {
+		return false;
+	}
+
+	return part instanceof (vscodeWithThinking.LanguageModelThinkingPart as any);
+}
+
+function readStringOption(
+	options: vscode.ProvideLanguageModelChatResponseOptions,
+	key: string,
+): string | undefined {
+	const opts = options as { modelConfiguration?: Record<string, unknown>; configuration?: Record<string, unknown> };
+
+	const modelConfig = opts.modelConfiguration;
+	if (modelConfig && typeof modelConfig === "object") {
+		const value = modelConfig[key];
+		if (typeof value === "string" && value.trim()) {
+			return value.trim();
+		}
+	}
+
+	const legacyConfig = opts.configuration;
+	if (legacyConfig && typeof legacyConfig === "object") {
+		const value = legacyConfig[key];
+		if (typeof value === "string" && value.trim()) {
+			return value.trim();
+		}
+	}
+
+	return undefined;
 }
